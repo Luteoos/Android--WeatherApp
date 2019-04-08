@@ -1,0 +1,139 @@
+package com.anno.presenters.photo
+
+import com.anno.globals.Parameters
+import com.anno.globals.Parameters.REMOVE_FLAG
+import com.anno.models.FlagWrapperImageView
+import com.anno.models.realmmodels.*
+import com.anno.network.RestUser
+import com.anno.network.api.PhotoSetsApi
+import com.anno.network.api.Request.AddFlagRequest
+import com.anno.network.api.Request.PDFReportType
+import com.anno.network.api.Request.UpdateFlagRequest
+import com.anno.network.api.Request.UpdatePhotosetRequest
+import com.anno.presenters.base.BasePresenter
+import com.anno.utils.Events
+import com.anno.utils.SessionManager
+import com.anno.utils.extensions.getFirst
+import com.anno.utils.extensions.saveOrUpdateToRealmAccordingDate
+import com.anno.utils.extensions.saveOrUpdateToRealmAccrodingDate
+import com.anno.utils.rx.SchedulerProvider
+import com.anno.views.interfaces.photo.NewPhotoActivityView
+import com.eightbitlab.rxbus.Bus
+import com.eightbitlab.rxbus.registerInBus
+import com.anno.utils.Gson
+import io.reactivex.android.schedulers.AndroidSchedulers
+import io.reactivex.disposables.Disposable
+import io.reactivex.schedulers.Schedulers
+import io.realm.Realm
+import timber.log.Timber
+import java.util.*
+
+/**
+ * Created by wojciechliberda on 14/08/2017.
+ */
+class NewPhotoActivityPresenter(
+        val view: NewPhotoActivityView,
+        uuidPhoto: String,
+        uuidPhotoSet: String,
+        val session: SessionManager,
+        realmUI: Realm,
+        val schedulers: SchedulerProvider) : BasePresenter(realmUI) {
+    var team: TeamRealm? = null
+    var photoSet: PhotoSetRealm? = null
+    var photo: PhotoRealm? = null
+    var currentFlagUUID = ""
+    var flagsHidden: Boolean = false
+    var idPhoto = UUID.fromString(uuidPhoto)!!
+    val idPhotoset = UUID.fromString(uuidPhotoSet)!!
+    private var listOfFlagView = mutableListOf<FlagWrapperImageView>()
+    private var currentFragment = 0
+    var isSliderVisible = false
+    private var shouldShowMessageEditText = false
+    internal var isRedirected = false
+    private var getFlagsRequestDisposable: Disposable? = null
+
+    var user: UserRealm? = realmUI.getFirst(session.userUUID, UserRealm::class.java)
+
+    init {
+        team = realmUI.getFirst(session.teamUUID, TeamRealm::class.java)
+        photoSet = realmUI.getFirst(
+                uuid = idPhotoset,
+                clazz = PhotoSetRealm::class.java
+        )
+        initPhotoInfo()
+    }
+
+    private fun initPhotoInfo() {
+        photo = realmUI.getFirst(
+                uuid = idPhoto,
+                clazz = PhotoRealm::class.java
+        )
+        view.setToolbarTitle(title = photo?.name, photosetTitle = photoSet?.name)
+    }
+
+    fun updatePhotoUUID(photoUUID: UUID) {
+        idPhoto = photoUUID
+        initPhotoInfo()
+    }
+
+    fun getFlagsWithSync(isNetworkAvailable: Boolean) {
+        if (isNetworkAvailable) {
+            val before = realmUI.copyFromRealm(photo!!.flags!!).sortedBy { it.created }.toTypedArray()
+            view.showProgressbar()
+            val photoSetsApi = RestUser.createService(PhotoSetsApi::class.java, SessionManager)
+            getFlagsRequestDisposable = photoSetsApi.getFlags(photosetUUID = idPhotoset, photoUUID = idPhoto)
+                    .subscribeOn(Schedulers.io())
+                    .map { response ->
+                        Realm.getDefaultInstance().use { realm ->
+                            val photo = realm.where(PhotoRealm::class.java)
+                                    .equalTo("uuid", idPhoto.toString())
+                                    .findFirst()
+                            if (photo?.flags?.size == 0) {
+                                return@map response.body()!!
+                            }
+                            photo?.flags?.forEach { flag ->
+                                if (!checkIfContain(response.body()!!, flag.uuid!!)) {
+                                    realm.executeTransaction { flag.cascadeDelete() }
+                                }
+                            }
+                        }
+                        response.body()!!
+                    }
+                    .map { it.saveOrUpdateToRealmAccrodingDate() }
+                    .map {
+                        Realm.getDefaultInstance().use { realm ->
+                            it.obj.forEach {
+                                val flagRealm = realm.getFirst(it.uid!!, FlagRealm::class.java)!!
+                                val photo = realm.getFirst(idPhoto, PhotoRealm::class.java)!!
+                                realm.executeTransaction {
+                                    if (!photo.flags!!.contains(flagRealm)) photo.flags?.add(flagRealm)
+                                }
+                            }
+                        }
+                    }
+                    .toList()
+                    .map {
+                        //isChanged is to prevent unnecessary flag views refresh
+                        var isChanged = false
+                        Realm.getDefaultInstance().use { realm ->
+                            val photo = realm.getFirst(idPhoto, PhotoRealm::class.java)
+                            val after = realm.copyFromRealm(photo!!.flags!!).sortedBy { it.created }.toTypedArray()
+                            if (after.isEmpty() || after.size != before.size) {
+                                isChanged = true
+                                Timber.d("DIFFERENT SIZE OR EMPTY")
+                            } else {
+                                for (i: Int in after.indices) {
+                                    val itemA = after[i]
+                                    val itemB = before[i]
+                                    if (itemA.uuid != itemB.uuid ||
+                                            itemA.changed != itemB.changed ||
+                                            itemA.flagType?.uuid != itemB.flagType?.uuid ||
+                                            itemA.flagType?.changed != itemB.flagType?.changed) {
+                                        isChanged = true
+                                        Timber.d("DIFFERENT CONTENT")
+                                    }
+                                }
+                            }
+                        }
+                        isChanged
+                  

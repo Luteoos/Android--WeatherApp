@@ -1,0 +1,351 @@
+package com.anno.adapters.recyclerview
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.Drawable
+import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.MediaPlayer
+import android.os.Build
+import android.support.v4.content.ContextCompat
+import android.support.v7.widget.RecyclerView
+import android.util.TypedValue
+import android.view.LayoutInflater
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.widget.*
+import com.amulyakhare.textdrawable.TextDrawable
+import com.anno.R
+import com.anno.models.realmmodels.NoteRealm
+import com.anno.models.realmmodels.ToDoStatus
+import com.anno.models.realmmodels.UserRealm
+import com.anno.utils.FlagIndexWrapper
+import com.anno.utils.SessionManager
+import com.anno.utils.createFlag
+import com.anno.utils.extensions.getFormattedCreationDate
+import com.anno.utils.glide.GlideApp
+import com.bumptech.glide.load.DataSource
+import com.bumptech.glide.load.engine.GlideException
+import com.bumptech.glide.request.RequestListener
+import com.bumptech.glide.request.target.Target
+import com.bumptech.glide.signature.ObjectKey
+import de.hdodenhof.circleimageview.CircleImageView
+import io.realm.RealmRecyclerViewAdapter
+import io.realm.RealmResults
+import timber.log.Timber
+
+
+/**
+ * Created by wojciechliberda on 18/09/2017.
+ */
+
+class RVAdapterChat(val themify: Typeface,
+                    val ctx: Context,
+                    val session: SessionManager,
+                    val font: Typeface,
+                    val list: RealmResults<NoteRealm>,
+                    private val onRVItemClickListener: OnRVItemClickListener,
+                    val allMode: Boolean = false,
+                    val flagIndexesList: List<FlagIndexWrapper> = emptyList(),
+                    val autoUpdate: Boolean) :
+        RealmRecyclerViewAdapter<NoteRealm, RVAdapterChat.ViewHolder>(list, autoUpdate) {
+
+    private var currentPlayingPosition = -1
+    private var playingViewHolder: ViewHolder? = null
+    private var mediaPlayer: MediaPlayer? = null
+    private var seekBarUpdater = SeekBarUpdater()
+    private var isClickable = true
+    private var flagIndexes = mutableListOf<FlagIndexWrapper>()
+
+    init {
+        flagIndexes.clear()
+        flagIndexes.addAll(flagIndexesList)
+    }
+
+    interface OnRVItemClickListener {
+        fun onRVItemClick(isClicked: Boolean, isActionUp: Boolean, note: NoteRealm?)
+    }
+
+    private inner class SeekBarUpdater : Runnable {
+        @SuppressLint("DefaultLocale")
+        override fun run() {
+            playingViewHolder?.let { playingViewHolder ->
+                val currentPosition = mediaPlayer?.currentPosition ?: 0
+                playingViewHolder.seekBar.progress = currentPosition
+                playingViewHolder.seekBar.postDelayed(this, 10)
+                var seconds = currentPosition / 1000
+                val minutes = seconds / 60
+                seconds -= (minutes * 60)
+                val buf = StringBuffer()
+                buf.append(java.lang.String.format("%02d", minutes))
+                buf.append(":")
+                buf.append(java.lang.String.format("%02d", seconds))
+                playingViewHolder.chronometer.text = buf
+            }
+        }
+    }
+
+    override fun getItemCount(): Int = list.size
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder =
+            ViewHolder(LayoutInflater.from(parent.context).inflate(R.layout.adapter_chat_row, parent, false))
+
+    override fun onBindViewHolder(holder: ViewHolder, position: Int) {
+        setFonts(holder)
+        setValues(holder, position)
+
+        if (position == currentPlayingPosition) {
+            playingViewHolder = holder
+            updatePlayingView()
+        } else {
+            updateNonPlayingView(holder)
+        }
+        removeAvatarViews(holder)
+        addAssignedPeopleIvs(holder, position)
+    }
+
+    private fun addAssignedPeopleIvs(holder: ViewHolder, position: Int) {
+        list[position]?.todos?.filter { it.assignedTo?.user?.userStatus == UserRealm.UserStatus.ACTIVE.toString() }?.forEach { toDoRealm ->
+            if (toDoRealm.assignedTo != null) {
+                val size = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 24f, ctx.resources.displayMetrics).toInt()
+                val userTodoCIv = CircleImageView(ctx)
+                val photoUrl = toDoRealm?.assignedTo?.user?.photo?.url
+                val lp: LinearLayout.LayoutParams = LinearLayout.LayoutParams(size, size)
+                lp.topMargin = 0
+                lp.bottomMargin = 0
+                lp.marginEnd = 0
+                lp.marginStart = 4
+                holder.todosIconsLayout.addView(userTodoCIv, lp)
+                val initials = "${toDoRealm?.assignedTo?.user?.firstName?.get(0)?.toUpperCase()}${toDoRealm?.assignedTo?.user?.lastName?.get(0)?.toUpperCase()}"
+                when (photoUrl) {
+                    null -> {
+                        initials.let { userTodoCIv.setImageDrawable(setPlaceHolder(initials)) }
+                    }
+                    else -> GlideApp.with(ctx)
+                            .load(photoUrl)
+                            .placeholder(setPlaceHolder(initials))
+                            .signature(ObjectKey(toDoRealm.assignedTo?.user?.photo?.uuid))
+                            .listener(object : RequestListener<Drawable> {
+                                override fun onLoadFailed(e: GlideException?, model: Any?, target: Target<Drawable>?, isFirstResource: Boolean): Boolean {
+                                    Timber.d("Loading failed")
+                                    return false
+                                }
+
+                                override fun onResourceReady(resource: Drawable?, model: Any?, target: Target<Drawable>?, dataSource: DataSource?, isFirstResource: Boolean): Boolean {
+                                    return false
+                                }
+                            })
+                            .into(userTodoCIv)
+                }
+                if (toDoRealm.status == ToDoStatus.COMPLETE.toString()) {
+                    userTodoCIv.borderColor = ContextCompat.getColor(ctx, R.color.colorTodoCompleted)
+                    userTodoCIv.borderWidth = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 3f, ctx.resources.displayMetrics).toInt()
+                    userTodoCIv.alpha = 0.2f
+                }
+            }
+        }
+    }
+
+    private fun removeAvatarViews(holder: ViewHolder) {
+        holder.todosIconsLayout.removeAllViews()
+    }
+
+    override fun onViewRecycled(holder: ViewHolder) {
+        super.onViewRecycled(holder)
+        if (currentPlayingPosition == holder.adapterPosition) {
+            updateNonPlayingView(playingViewHolder)
+            playingViewHolder = null
+        }
+
+    }
+
+    fun setFlagIndexes(listFlagIndexes: List<FlagIndexWrapper>) {
+        flagIndexes.clear()
+        flagIndexes.addAll(listFlagIndexes)
+        notifyDataSetChanged()
+    }
+
+    private fun setFonts(holder: ViewHolder?) {
+        holder?.apply {
+            tvDate.typeface = font
+            tvUserName.typeface = font
+            tvNote.typeface = font
+            chronometer.typeface = font
+            tvPlay.typeface = themify
+            tvAssignmentIcon.typeface = themify
+
+        }
+    }
+
+    private fun updateNonPlayingView(holder: ViewHolder?) {
+        holder?.seekBar?.removeCallbacks(seekBarUpdater)
+        holder?.seekBar?.isEnabled = false
+        holder?.seekBar?.progress = 0
+        holder?.chronometer?.text = "00:00"
+        holder?.tvPlay?.text = ctx.resources.getString(R.string.ic_play)
+    }
+
+
+    private fun updatePlayingView() {
+        playingViewHolder?.seekBar?.max = mediaPlayer?.duration ?: 0
+        playingViewHolder?.seekBar?.progress = mediaPlayer?.currentPosition ?: 0
+        playingViewHolder?.seekBar?.isEnabled = true
+        if (mediaPlayer?.isPlaying == true) {
+            playingViewHolder?.seekBar?.postDelayed(seekBarUpdater, 10)
+        } else {
+            playingViewHolder?.seekBar?.removeCallbacks(seekBarUpdater)
+        }
+
+    }
+
+    @SuppressLint("SetTextI18n", "ClickableViewAccessibility")
+    private fun setValues(holder: ViewHolder?, position: Int) {
+        holder?.apply {
+            when (list[position]?.filePath == null) {
+                true -> {
+                    tvPlay.isEnabled = false
+                    tvPlay.visibility = View.INVISIBLE
+                    progressBar.visibility = View.VISIBLE
+                }
+                false -> {
+                    tvPlay.isEnabled = true
+                    tvPlay.visibility = View.VISIBLE
+                    progressBar.visibility = View.INVISIBLE
+                }
+            }
+
+            foregroundLayer.setOnTouchListener(initOnTouchListener({ isAClick, isActionUp ->
+                onRVItemClickListener.onRVItemClick(isAClick, isActionUp, list[position])
+            }))
+
+            when (allMode) {
+                true -> {
+                    var indexLabel = " "
+                    flagIndexes.forEach { flagIndexWrapper ->
+                        if (flagIndexWrapper.uuid == list[position]?.flag?.uid) {
+                            indexLabel = flagIndexWrapper.index.toString()
+                            return@forEach
+                        }
+                    }
+                    val color = list[position]?.flag?.flagType?.color ?: "ffffff"
+                    val drawable = createFlag(28f, Color.parseColor("#$color"), ctx.resources, ctx, indexLabel)
+                    ivFlag.setImageDrawable(drawable)
+                    ivFlag.visibility = View.VISIBLE
+                }
+            }
+
+            tvDate.text = list[position]?.getFormattedCreationDate("dd/MM/yyyy HH:mm")
+            tvUserName.text = list[position]?.entityAuthor?.firstName + " " + list[position]?.entityAuthor?.lastName
+            tvNote.text = list[position]?.text
+            chronometer.text = "00:00"
+            seekBar.isEnabled = false
+            if (list[position]?.attachment != null) {
+                audioRelativeLayout.visibility = View.VISIBLE
+                tvNote.visibility = View.GONE
+            } else {
+                tvNote.visibility = View.VISIBLE
+                audioRelativeLayout.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun initOnTouchListener(callback: (Boolean, Boolean) -> Unit): View.OnTouchListener {
+        return object : View.OnTouchListener {
+            val CLICK_ACTION_THRESHOLD = 100
+            var startX: Float = 0f
+            var startY: Float = 0f
+            override fun onTouch(v: View, event: MotionEvent): Boolean {
+                if (isClickable) {
+                    when (event.action) {
+                        MotionEvent.ACTION_DOWN -> {
+                            startX = event.x
+                            startY = event.y
+                        }
+                        MotionEvent.ACTION_UP -> {
+                            if (isAClick(startX, startY, event.x, event.y)) {
+                                isClickable = false
+                                v.performClick()
+                                callback(true, true)
+                                return false
+                            } else {
+                                callback(false, true)
+                                return false
+                            }
+                        }
+                    }
+                }
+                callback(false, false)
+                return false
+            }
+
+            fun isAClick(startX: Float, startY: Float, endX: Float, endY: Float): Boolean {
+                val differenceX = Math.abs(startX - endX)
+                val differenceY = Math.abs(startY - endY)
+                return !(differenceX > CLICK_ACTION_THRESHOLD || differenceY > CLICK_ACTION_THRESHOLD)
+            }
+        }
+    }
+
+    inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+        val tvNote = view.findViewById<TextView>(R.id.tvNote)!!
+        val tvDate = view.findViewById<TextView>(R.id.tvDate)!!
+        val tvUserName = view.findViewById<TextView>(R.id.tvUserName)!!
+        val tvPlay = view.findViewById<TextView>(R.id.tvAudioAction)!!
+        val seekBar = view.findViewById<SeekBar>(R.id.tvSeekBar)!!
+        val chronometer = view.findViewById<Chronometer>(R.id.chronometer)!!
+        val audioRelativeLayout = view.findViewById<RelativeLayout>(R.id.audioRelativeLayout)!!
+        val progressBar = view.findViewById<ProgressBar>(R.id.progressBar)!!
+        val tvAssignmentIcon = view.findViewById<TextView>(R.id.tvAssignmentIcon)!!
+        val foregroundLayer = view.findViewById<RelativeLayout>(R.id.foregroundLayer)!!
+        val todosIconsLayout = view.findViewById<LinearLayout>(R.id.todosIconsLayout)!!
+        val ivFlag = view.findViewById<ImageView>(R.id.ivFlag)!!
+
+        init {
+            tvPlay.setOnClickListener {
+                if (adapterPosition == currentPlayingPosition) {
+                    if (mediaPlayer?.isPlaying == true) {
+                        playingViewHolder?.tvPlay?.text = ctx.resources.getString(R.string.ic_play)
+                        mediaPlayer?.pause()
+                    } else {
+                        mediaPlayer?.start()
+                        playingViewHolder?.tvPlay?.text = ctx.resources.getString(R.string.ic_pause)
+                    }
+                } else {
+                    currentPlayingPosition = adapterPosition
+                    mediaPlayer?.let { mediaPlayer ->
+                        playingViewHolder?.let {
+                            updateNonPlayingView(it)
+                        }
+                        mediaPlayer.release()
+                    }
+                    playingViewHolder = this
+                    playingViewHolder?.tvPlay?.text = ctx.resources.getString(R.string.ic_pause)
+                    list[currentPlayingPosition]?.filePath?.let {
+                        startMediaPlayer(it)
+                    }
+                }
+                updatePlayingView()
+            }
+
+            seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser)
+                        mediaPlayer?.seekTo(progress)
+                }
+
+                override fun onStartTrackingTouch(p0: SeekBar?) {
+
+                }
+
+                override fun onStopTrackingTouch(p0: SeekBar?) {
+
+                }
+            })
+        }
+
+    }
+
+    private fun startMediaPlayer(filePath: String) {
+        mediaPlayer = Me

@@ -1,0 +1,236 @@
+package com.anno.presenters.navigationfragments
+
+import com.anno.globals.Parameters
+import com.anno.models.UserMembership
+import com.anno.models.realmmodels.*
+import com.anno.network.RestUser
+import com.anno.network.api.PhotoSetsApi
+import com.anno.network.api.UserApi
+import com.anno.presenters.base.BasePresenter
+import com.anno.utils.Events
+import com.anno.utils.SessionManager
+import com.anno.utils.extensions.getFirst
+import com.anno.utils.extensions.saveOrUpdateToRealmAccordingDate
+import com.anno.views.interfaces.navigationfragments.TodoInnerView
+import com.eightbitlab.rxbus.Bus
+import io.reactivex.Flowable
+import io.reactivex.android.schedulers.AndroidSchedulers
+import io.reactivex.functions.BiFunction
+import io.reactivex.schedulers.Schedulers
+import io.realm.Realm
+import io.realm.RealmList
+import io.realm.RealmResults
+import io.realm.Sort
+import retrofit2.Response
+import timber.log.Timber
+
+/**
+ * Created by wojciechliberda on 10/01/2018.
+ */
+class TodoInnerPresenter(realm: Realm,
+                         val session: SessionManager,
+                         val todoStatus: String,
+                         val view: TodoInnerView) : BasePresenter(realm) {
+    val user = realmUI.getFirst(session.userUUID, UserRealm::class.java)!!
+    val team = realmUI.getFirst(session.teamUUID, TeamRealm::class.java)!!
+
+    init {
+        Bus.observe<Events.Message>()
+                .subscribe {
+                    when (it.message) {
+                        Parameters.ASSIGNED_BY_ME -> {
+                            view.filterResultsCreatedByMe()
+                        }
+                        Parameters.ASSIGNED_TO_ME -> {
+                            view.filterResultsAssignedToMe()
+
+                        }
+                    }
+                }
+    }
+
+    fun getTodo(isNetworkConnected: Boolean, sync: Boolean) {
+        view.showProgressbar()
+        val list = getListFromDb()
+        list.map { todo ->
+            if (todo.note != null)
+                realmUI.executeTransaction {
+                    todo.isDeletable = checkDeleteTodoPermissions(todo, getLoggedUserMembershipFromDB()!!)
+                    todo.isMarkable = checkIfCanMarkAsComplete(todo, getLoggedUserMembershipFromDB()!!)
+                }
+        }
+        // if isNetworkConnected show the cached values in NON-autoupdating adapter until get fresh
+        view.setRecyclerView(list, todoStatus, !(isNetworkConnected && sync))
+        //TODO when Marek will do an endpoint fo it
+//        val unreadList =
+//        view.updateAdapterUnreadTodoList()
+        if (sync) {
+            restCall(isNetworkConnected)
+        } else {
+            if (list.isEmpty())
+                view.showNoTodos()
+            view.hideProgressbar()
+        }
+
+    }
+
+    private fun checkDeleteTodoPermissions(todoRealm: ToDoRealm, userMembershipRealm: UserMembershipRealm): Boolean =
+            if (userMembershipRealm.user?.uid == null) false
+            else when (userMembershipRealm.roleType) {
+                UserMembership.UserRoleType.TEAM_ADMINISTRATOR.toString() -> true
+                else -> userMembershipRealm.user?.uid == todoRealm.entityAuthor?.uid
+            }
+
+    private fun getLoggedUserMembershipFromDB(realm: Realm = realmUI): UserMembershipRealm? {
+        return realm.where(UserMembershipRealm::class.java)
+                .equalTo("team.uuid", session.teamUUIDString)
+                .findAll()?.firstOrNull { it.user?.uid == session.userUUID }
+    }
+
+    private fun checkIfCanMarkAsComplete(todo: ToDoRealm, loggedUser: UserMembershipRealm): Boolean {
+        val assignedTo = todo.assignedTo
+        if (loggedUser.roleType == UserMembership.UserRoleType.TEAM_ADMINISTRATOR.toString()) return true
+        if (assignedTo?.uid == null || loggedUser.uid == null) return false
+        if (loggedUser.uid == assignedTo.uid) return true
+        return false
+    }
+
+    fun restCall(isNetworkConnected: Boolean) {
+        if (isNetworkConnected) {
+            restCallAllTodos()
+//            restCallUnreadList()
+        } else {
+            view.hideProgressbar()
+            view.setRefreshingFalse()
+        }
+    }
+
+    private fun restCallUnreadList() {
+//TODO("not implemented")
+    }
+
+
+    private fun getUserTodosFlowable(): Flowable<ToDoRealm> {
+        val client = RestUser.createService(UserApi::class.java, session)
+        return Flowable.zip(client.getToDosAssignedToUserInTeam(session.userUUID, session.teamUUID, "GET"),
+                client.getToDosCreatedByUserInTeam(session.userUUID, session.teamUUID, "GET"),
+                BiFunction<Response<RealmList<ToDoRealm>>,
+                        Response<RealmList<ToDoRealm>>,
+                        List<ToDoRealm>> { assignedTo, createdBy ->
+                    val list: MutableList<ToDoRealm> = mutableListOf()
+                    list.addAll(assignedTo.body()!!)
+                    list.addAll(createdBy.body()!!)
+                    list.filter { it.active }
+                            .filter { it.assignedTo?.user?.userStatus == UserRealm.UserStatus.ACTIVE.toString() }
+                })
+                .subscribeOn(Schedulers.io())
+                .map { list ->
+                    val realm = Realm.getDefaultInstance()
+                    realm.use {
+                        list.forEach {
+                            val userTodos = realm.where(ToDoRealm::class.java)
+                                    ?.equalTo("assignedTo.user.uuid", it.assignedTo!!.user!!.uuid!!)
+                                    ?.findAll()
+//                            val user = realm.getFirst(it.assignedTo!!.user!!.uid!!, UserRealm::class.java)
+//                            if (user?.toDos?.size == 0) return@map list
+                            userTodos?.forEach { todo ->
+                                if (!checkIfContain(list, todo.uuid!!) && todo.note != null)
+                                    realm.executeTransaction {
+                                        it.getFirst(todo.uid!!, ToDoRealm::class.java)?.cascadeDelete()
+                                    }
+                            }
+                        }
+                        list
+                    }
+                }
+                .flatMapIterable { it }
+                .map {
+                    it.assignedTo?.user?.saveOrUpdateToRealmAccordingDate()
+                    it.saveOrUpdateToRealmAccordingDate()!!
+                }
+                .map { todo ->
+                    Realm.getDefaultInstance().use { realm ->
+                        val todoRealm = realm.getFirst(todo.uid!!, ToDoRealm::class.java)!!
+                        val user = realm.getFirst(todo.assignedTo!!.user!!.uid!!, UserRealm::class.java)
+
+                        realm.executeTransaction {
+                            if (todoRealm.note != null) {
+                                val noteRealm = realm.getFirst(todoRealm.note?.uid!!, NoteRealm::class.java)!!
+                                if (!checkIfContain(noteRealm.todos!!, todo.uuid!!)) {
+                                    noteRealm.todos?.add(todoRealm)
+                                }
+                            }
+                            user?.toDos?.let { todos ->
+                                if (!checkIfContain(todos, todo.uuid!!)) {
+                                    todos.add(todoRealm)
+                                }
+                            }
+                            //code below is weird but dependencies were null i don't know why yet
+                            val photoSet = realm.getFirst(todo.photo?.photoSet?.uid!!, PhotoSetRealm::class.java)
+                            val teamRealm = realm.getFirst(session.teamUUID, TeamRealm::class.java)
+                            if (!teamRealm?.listOfPhotoSets?.contains(photoSet)!!) {
+                                teamRealm.listOfPhotoSets?.add(photoSet)
+                            }
+
+                            if (todoRealm.photoSet == null) {
+                                todoRealm.photoSet = photoSet
+                            }
+
+                            if (todoRealm.photo?.photoSet == null) {
+                                todoRealm.photo?.photoSet = photoSet
+                            }
+                        }
+                    }
+                    todo
+                }
+    }
+
+    private fun processRestResultFlowable(flowable: Flowable<ToDoRealm>) {
+        disposable.add(flowable
+                .map { todo ->
+                    Realm.getDefaultInstance().use { realm ->
+                        val todoRealm = realm.getFirst(todo.uid!!, ToDoRealm::class.java)!!
+                        realm.executeTransaction {
+                            todoRealm.isDeletable = checkDeleteTodoPermissions(todoRealm, getLoggedUserMembershipFromDB(realm)!!)
+                            todoRealm.isMarkable = checkIfCanMarkAsComplete(todoRealm, getLoggedUserMembershipFromDB(realm)!!)
+                        }
+                    }
+                    todo
+                }
+                .toList()
+                .observeOn(AndroidSchedulers.mainThread())
+                .doAfterTerminate {
+                    view.hideProgressbar()
+                    view.setRefreshingFalse()
+                    realmUI.refresh()
+                }
+                .subscribe({
+                    if (it.isNotEmpty()) view.hideNoTodos()
+                    view.setRecyclerView(getListFromDb(), todoStatus, true)
+                    Timber.d("Success")
+                }, {
+                    Timber.e(it)
+                })
+        )
+    }
+
+    private fun restCallAllTodos() {
+        processRestResultFlowable(getAllTodosFlowable())
+    }
+
+    private fun getAllTodosFlowable(): Flowable<ToDoRealm> {
+        return getUserPhotoTodosFlowable()
+                .mergeWith(getUserTodosFlowable())
+    }
+
+    private fun <T : PhotosurveyEntityRealm> checkIfContain(list: List<T>, id: String): Boolean {
+        list.forEach {
+            if (it.uuid?.equals(id)!!) return true
+        }
+        return false
+    }
+
+
+    private fun getUserPhotoTodosFlowable(): Flowable<ToDoRealm> {
+        val client = RestUser.createService(UserApi::class.java, session)
+        

@@ -1,0 +1,115 @@
+package com.anno.utils.extensions
+
+import com.anno.globals.Constants
+import com.anno.models.RealmObjectWrapper
+import com.anno.models.realmmodels.*
+import com.anno.utils.Gson
+import io.realm.Realm
+import io.realm.RealmList
+import io.realm.RealmObject
+import timber.log.Timber
+import java.text.SimpleDateFormat
+import java.util.*
+
+
+fun <T : RealmObject> Realm.getListAsCopy(list: MutableList<T>): MutableList<T> {
+    return this.copyFromRealm(list)
+}
+
+
+fun <T : RealmObject> T.saveOrUpdateToRealm(): T? {
+    val realm = Realm.getDefaultInstance()
+    realm.use { realm ->
+        realm.executeTransaction {
+            (this as? PhotosurveyEntityRealm)?.let { dataObject ->
+                validateObjectProperties(dataObject, realm)
+            }
+            it.copyToRealmOrUpdate(this)
+        }
+        realm.refresh()
+    }
+    return this
+}
+
+fun <T : RealmObject, V : RealmObject> T.saveOrUpdateFromJsonToRealm(clazz: Class<V>, jsonString: String): T? {
+    val realm = Realm.getDefaultInstance()
+    realm.use { realm ->
+        realm.executeTransaction {
+            realm.createOrUpdateObjectFromJson(clazz, jsonString)
+        }
+    }
+    return this
+}
+
+
+fun <T : RealmObject> T.saveOrUpdateToRealmAccordingDate(refreshAfter: Boolean = true): T? {
+    val realm = Realm.getDefaultInstance()
+    realm.use {
+        val clazz = this.javaClass
+        (this as? PhotosurveyEntityRealm)?.let { dataObject ->
+            realm.executeTransaction { realm ->
+                validateObjectProperties(dataObject, realm)
+                val realmObject = realm.getFirst(dataObject.uid!!, clazz)
+                if (realmObject == null) {
+                    dataObject.sync = true
+                    realm.createOrUpdateObjectFromJson(clazz, Gson().toJson(dataObject))
+                    return@executeTransaction
+                }
+                (realmObject as? PhotosurveyEntityRealm)?.let {
+                    val sdf = SimpleDateFormat(Constants.DATE_FORMAT, Locale.getDefault())
+                    if (realmObject.changed == null) {
+                        realm.createOrUpdateObjectFromJson(clazz, Gson().toJson(dataObject))
+                        return@let
+                    }
+                    if (dataObject.changed == null) return@let
+                    val dateOfRealmObject = sdf.parse(realmObject.changed)
+                    when (dateOfRealmObject.compareTo(sdf.parse(dataObject.changed))) {
+                        1 -> Timber.d("GCM Sync")
+                        0 -> realmObject.sync = true
+                        -1 -> {
+                            realm.createOrUpdateObjectFromJson(clazz, Gson().toJson(dataObject))
+                        }
+                        else -> Timber.d("GCM Sync")
+
+                    }
+                }
+            }
+        }
+        if(refreshAfter) realm.refresh()
+    }
+    return this
+}
+
+fun validateObjectProperties(dataObject: PhotosurveyEntityRealm, realm: Realm) {
+    //To prevent replacing photo media with null urls
+    when (dataObject) {
+        is ToDoRealm -> {
+            dataObject.photo?.uid?.let { photoUUID ->
+                realm.getFirst(photoUUID, PhotoRealm::class.java)?.let { photoRealm ->
+                    if (dataObject.photo?.media?.url.isNullOrEmpty())
+                        dataObject.photo?.media?.url = photoRealm.media?.url
+                    else
+                        photoRealm.media?.url = dataObject.photo?.media?.url
+                }
+            }
+            dataObject.note?.uid?.let { noteUUID ->
+                realm.getFirst(noteUUID, NoteRealm::class.java)?.let { noteRealm ->
+                    dataObject.note?.filePath = noteRealm.filePath
+                }
+            }
+        }
+        is PhotoRealm -> {
+            dataObject.uid?.let { photoUUID ->
+                realm.getFirst(photoUUID, PhotoRealm::class.java)?.let { photoRealm ->
+                    if (dataObject.media?.url.isNullOrEmpty())
+                        dataObject.media?.url = photoRealm.media?.url
+                    else
+                        photoRealm.media?.url = dataObject.media?.url
+                }
+            }
+        }
+        is MediaRealm -> {
+            dataObject.uid?.let { mediaUUID ->
+                realm.getFirst(mediaUUID, MediaRealm::class.java)?.let { mediaRealm ->
+                    if (dataObject.url.isNullOrEmpty())
+           

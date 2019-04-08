@@ -1,0 +1,216 @@
+package com.anno.presenters.membershipinfo
+
+import com.anno.models.MediaInfo
+import com.anno.models.realmmodels.*
+import com.anno.network.RestUser
+import com.anno.network.api.UserApi
+import com.anno.presenters.base.BasePresenter
+import com.anno.utils.Events
+import com.anno.utils.SessionManager
+import com.anno.utils.extensions.getFirst
+import com.anno.utils.extensions.saveOrUpdateToRealmAccordingDate
+import com.anno.views.interfaces.membershipinfo.MembershipInfoActivityView
+import com.eightbitlab.rxbus.Bus
+import com.eightbitlab.rxbus.registerInBus
+import io.reactivex.android.schedulers.AndroidSchedulers
+import io.reactivex.schedulers.Schedulers
+import io.realm.Realm
+import io.realm.Sort
+import timber.log.Timber
+import java.util.*
+
+/**
+ * Created by ksikorski on 27.02.2018.
+ */
+class MembershipInfoActivityPresenter(realmUI: Realm, val view: MembershipInfoActivityView, userMembershipRealmUUID: String, val session: SessionManager) : BasePresenter(realmUI) {
+
+    private val userMembershipRealm = realmUI.getFirst(UUID.fromString(userMembershipRealmUUID), UserMembershipRealm::class.java)
+    var mediaInfo: MediaInfo? = null
+    var initials: String = ""
+    var user: UserRealm?
+
+    init {
+        userMembershipRealm?.user?.firstName?.let {
+            if (it != "") initials += it[0].toUpperCase()
+        }
+        userMembershipRealm?.user?.lastName?.let {
+            if (it != "") initials += it[0].toUpperCase()
+        }
+        userMembershipRealm?.user?.photo?.apply {
+            url?.let { url ->
+                uid?.let { uuid ->
+                    mediaInfo = MediaInfo(url, uuid)
+                }
+            }
+        }
+
+        val fullName = userMembershipRealm?.user?.fullName
+        val role = userMembershipRealm?.roleType
+        user = userMembershipRealm?.user
+        view.setNameAndRole(fullName, role)
+
+        initBus()
+    }
+
+    private fun initBus() {
+        Bus.observe<Events.Resume>()
+                .subscribe {
+                    realmUI.refresh()
+                    updateValues()
+                    view.hideProgressbar()
+                    view.setRefreshingFalse()
+                }.registerInBus(this)
+    }
+
+    fun updateValues() {
+        val photosCount = realmUI
+                .where(PhotoRealm::class.java)
+                .equalTo("entityAuthor.uuid", userMembershipRealm?.user?.uuid)
+                .equalTo("active", true)
+                .equalTo("photoSet.team.uuid", session.teamUUIDString)
+                .count()
+                .toString()
+
+        val flagsCount = realmUI
+                .where(FlagRealm::class.java)
+                .equalTo("entityAuthor.uuid", userMembershipRealm?.user?.uuid)
+                .equalTo("photo.photoSet.team.uuid", session.teamUUIDString)
+                .equalTo("active", true)
+                .count()
+                .toString()
+
+        val completedTodos = userMembershipRealm
+                ?.user
+                ?.toDos
+                ?.where()
+                ?.equalTo("status", ToDoStatus.COMPLETE.toString())
+                ?.equalTo("active", true)
+                ?.equalTo("photo.photoSet.team.uuid", session.teamUUIDString)
+                ?.findAll()
+                ?.count()
+                .toString()
+
+        val notCompletedTodos = userMembershipRealm
+                ?.user
+                ?.toDos
+                ?.where()
+                ?.equalTo("status", ToDoStatus.INCOMPLETE.toString())
+                ?.equalTo("active", true)
+                ?.equalTo("photo.photoSet.team.uuid", session.teamUUIDString)
+                ?.findAll()
+                ?.count()
+                .toString()
+
+        view.setValues(photosCount, flagsCount, completedTodos, notCompletedTodos)
+    }
+
+    fun getUserPhotos(internetAvailable: Boolean) {
+        val photoList = realmUI
+                .where(PhotoRealm::class.java)
+                .equalTo("entityAuthor.uuid", userMembershipRealm?.user?.uuid)
+                .equalTo("media.active", true)
+                .equalTo("active", true)
+                .equalTo("photoSet.team.uuid", session.teamUUIDString)
+                .sort("created", Sort.DESCENDING)
+                .findAll()
+
+        view.setRVAdapter(photoList)
+        if (internetAvailable) {
+            sync()
+        }
+    }
+
+    fun sync() {
+        syncUserTodos()
+        syncUserPhotos()
+    }
+
+    private fun syncUserPhotos() {
+        val membershipUserUUID = userMembershipRealm?.user?.uuid
+        val client = RestUser.createService(UserApi::class.java, session)
+        disposable.add(client.getPhotosCreatedByUser(user?.uid!!, session.teamUUID)
+                .subscribeOn(Schedulers.io())
+                .map {
+                    it.body()!!.filter { it.active }
+                }
+                .map { responseList ->
+                    Realm.getDefaultInstance().use { realm ->
+                        val userPhotos = realm.copyFromRealm(realm
+                                .where(PhotoRealm::class.java)
+                                .equalTo("entityAuthor.uuid", membershipUserUUID)
+                                .equalTo("media.active", true)
+                                .equalTo("active", true)
+                                .equalTo("photoSet.team.uuid", session.teamUUIDString)
+                                .sort("created", Sort.DESCENDING)
+                                .findAll())
+
+                        userPhotos.forEach { photoRealm ->
+                            if (!checkIfContain(responseList, photoRealm.uuid!!))
+                                realm.executeTransaction {
+                                    it.getFirst(photoRealm.uid!!, PhotoRealm::class.java)?.cascadeDelete()
+                                }
+                        }
+                    }
+                    responseList
+                }
+                .map {
+                    it.forEach { photoRest ->
+                        photoRest.saveOrUpdateToRealmAccordingDate()
+                        Realm.getDefaultInstance().use { realm ->
+                            val photoRealm = realm.getFirst(photoRest.uid!!, PhotoRealm::class.java)
+                            val photoSet = realm.getFirst(photoRest.photoSet?.uid!!, PhotoSetRealm::class.java)
+                            val team = realm.getFirst(photoRest.photoSet?.team?.uid!!, TeamRealm::class.java)
+                            realm.executeTransaction {
+                                photoRealm?.photoSet = photoSet
+                                photoSet?.team = team
+                            }
+                        }
+                        photoRest
+                    }
+                }
+                .toList()
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe({
+                    updateValues()
+                    realmUI.refresh()
+                }, {
+                    Timber.e(it)
+                }))
+    }
+
+    private fun syncUserTodos() {
+        val membershipUserUUID = userMembershipRealm?.user?.uid!!
+        val client = RestUser.createService(UserApi::class.java, session)
+        disposable.add(client.getToDosAssignedToUserInTeam(user?.uid!!, session.teamUUID, "GET")
+                .subscribeOn(Schedulers.io())
+                .map { it.body()!!.filter { it.active } }
+                .map { list ->
+                    val realm = Realm.getDefaultInstance()
+                    realm.use {
+                        val user = realm.getFirst(membershipUserUUID, UserRealm::class.java)!!
+                        if (user.toDos?.size == 0) return@map list
+                        val todos = realm.copyFromRealm(user.toDos!!)
+                        todos?.forEach { todo ->
+                            if (!checkIfContain(list, todo.uuid!!) && todo.note != null)
+                                realm.executeTransaction {
+                                    it.getFirst(todo.uid!!, ToDoRealm::class.java)?.cascadeDelete()
+                                }
+                        }
+                        list
+                    }
+                }
+                .flatMapIterable { it }
+                .map { it.saveOrUpdateToRealmAccordingDate()!! }
+                .map { todo ->
+                    Realm.getDefaultInstance().use { realm ->
+                        val todoRealm = realm.getFirst(todo.uid!!, ToDoRealm::class.java)!!
+                        val user = realm.getFirst(todo.assignedTo!!.user!!.uid!!, UserRealm::class.java)
+
+                        realm.executeTransaction {
+                            if (todoRealm.note != null) {
+                                val noteRealm = realm.getFirst(todo.note?.uid!!, NoteRealm::class.java)!!
+                                if (!noteRealm.todos!!.contains(todoRealm)) {
+                                    noteRealm.todos?.add(todoRealm)
+                                }
+                            }
+        

@@ -1,0 +1,3 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <string name="denied_permission">Denied permission! Its needed to find weather</string>
+</resources>
