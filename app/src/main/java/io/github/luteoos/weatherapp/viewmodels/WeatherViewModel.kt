@@ -7,10 +7,14 @@ import io.github.luteoos.weatherapp.network.RestApi
 import io.github.luteoos.weatherapp.network.WeatherApi
 import io.github.luteoos.weatherapp.network.response.WeatherResponse
 import io.reactivex.android.schedulers.AndroidSchedulers
+import io.reactivex.disposables.CompositeDisposable
 import io.reactivex.schedulers.Schedulers
 
 class WeatherViewModel: BaseViewModel() {
 
+    val ERROR = 2137
+
+    val disposable: CompositeDisposable = CompositeDisposable()
     val weather: MutableLiveData<WeatherResponse> = MutableLiveData()
 
     fun getWeather(lat: String, lon: String){
@@ -22,7 +26,7 @@ class WeatherViewModel: BaseViewModel() {
                 if(it.code() == 200)
                     weather.value = it.body()
             },{
-            send("ERROR")
+            send(ERROR)
         }))
     }
 }

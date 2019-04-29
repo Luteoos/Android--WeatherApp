@@ -68,7 +68,7 @@ dependencies {
     implementation "com.eightbitlab:rxbus:1.0.2"
 
     //GitHub Impementations
-    implementation "com.github.Luteoos:Android--MVVMLib:2.0.3"
+    implementation 'com.github.Luteoos:Android--MVVMLib:3.0.0'
     implementation 'com.github.cdflynn:checkview:v1.1'
     implementation 'com.github.GrenderG:Toasty:1.3.1'
 

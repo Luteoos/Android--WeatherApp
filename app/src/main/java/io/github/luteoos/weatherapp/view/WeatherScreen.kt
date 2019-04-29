@@ -18,7 +18,7 @@ import org.jetbrains.anko.sdk27.coroutines.onClick
 import org.jetbrains.anko.support.v4.ctx
 
 class WeatherScreen: BaseActivityMVVM<WeatherViewModel>() {
-    private val LOC_PERM_CODE = 2137
+    private val LOC_PERM_CODE = 666
 
     override fun getLayoutID(): Int = R.layout.activity_weather_screen
 
@@ -39,9 +39,10 @@ class WeatherScreen: BaseActivityMVVM<WeatherViewModel>() {
         viewModel.weather.observe(this, Observer { weather -> textView.text = weather.toString()})
     }
 
-    override fun onVMMessage(msg: String?) {
+    override fun onVMMessage(msg: Int?){
+        super.onVMMessage(msg)
         when(msg){
-            "ERROR" -> Toasty.error(this, "unknown error").show()
+            viewModel.ERROR -> Toasty.error(this, "unknown error").show()
         }
     }
 
