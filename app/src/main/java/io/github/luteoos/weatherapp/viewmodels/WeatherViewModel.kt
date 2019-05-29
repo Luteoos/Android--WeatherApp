@@ -13,6 +13,7 @@ import io.reactivex.schedulers.Schedulers
 class WeatherViewModel: BaseViewModel() {
 
     val ERROR = 2137
+    val celcius_sign = "\u2103"
 
     val disposable: CompositeDisposable = CompositeDisposable()
     val weather: MutableLiveData<WeatherResponse> = MutableLiveData()
